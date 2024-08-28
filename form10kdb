@@ -1,0 +1,230 @@
+import json, re
+import pandas as pd
+from sec_api import ExtractorApi
+from bs4 import BeautifulSoup
+import requests
+import time
+import numpy as np
+from tqdm import tqdm
+from datetime import datetime, timedelta
+import sqlite3
+import ast
+from sec_api import FullTextSearchApi
+from sec_api import QueryApi
+import configparser
+from cryptography.fernet import Fernet
+import os
+import openai
+import tiktoken
+from dateutil.relativedelta import relativedelta
+import multiprocessing
+# 설정 파일 읽기
+config = configparser.ConfigParser()
+config.read('/DAProjects/Projects/nGenAI/scr/config.ini')
+
+# 암호화된 API 키 가져오기
+encrypted_secapi_key = config['API_KEYS']['secapikey'].encode('utf-8')
+encrypted_openai_key = config['API_KEYS']['openaikey_qa'].encode('utf-8')
+
+#key
+cipher_suite = Fernet('NA6zCSbP6pIrqBtJXAv6XkRLWvCzUacOPbEe___mhpo=')
+
+# API 키 복호화
+secapi_key = cipher_suite.decrypt(encrypted_secapi_key).decode('utf-8')
+openai_key = cipher_suite.decrypt(encrypted_openai_key).decode('utf-8')
+
+# API key
+API_KEY = secapi_key
+extractorApi = ExtractorApi(API_KEY)
+fullTextSearchApi = FullTextSearchApi(api_key=API_KEY)
+queryApi = QueryApi(api_key=API_KEY)
+openai.api_key = openai_key
+
+  # SQLite에서 데이터 조회
+# streaming form8K
+conn1 = sqlite3.connect('/DAProjects/Projects/nGenAI/scr/DEV/update/change_stream_edgar.db')
+
+query_string = '''
+SELECT distinct *
+FROM change_stream_edgar 
+where 1=1
+    and change_stream_edgar.formType in ('10-K','10-Q')
+order by change_stream_edgar.filedAt
+'''
+
+new_filings = pd.read_sql_query(query_string, conn1)
+
+conn1.close()
+
+
+conn = sqlite3.connect('/DAProjects/Projects/nGenAI/scr/DEV/update/form10k.db')
+c = conn.cursor()
+# 테이블 생성
+c.execute("""CREATE TABLE IF NOT EXISTS 
+form10k(
+  id TEXT
+    ,ticker TEXT
+    ,companyName TEXT
+    ,formType TEXT
+    ,description TEXT
+    ,filedAt TEXT
+    ,linkToFilingDetails TEXT
+    ,documentFormatFiles TEXT
+    ,item TEXT
+  )""")
+conn.commit()
+conn.close()
+
+# process_row 함수를 전역 함수로 정의
+def process_row(row_index):
+    filing_url = new_filings['linkToFilingDetails'].iloc[row_index]
+
+    item_data = {}
+    for item in ["1", "1A", "1B", "1C", "2", "3", "4", "5", "6", "7", "7A", "8", "9", "9A", "9B", "10", "11", "12", "13", "14","15"]:
+        section_html = extractorApi.get_section(filing_url, item, "html")
+        item_data[item] = section_html  # key 값을 item 으로 변경
+
+    return {'item': item_data} 
+
+
+def make_10k(query):
+    global new_filings
+    # 'linkToFilingDetails' 열의 값에서 따옴표 제거
+    new_filings['linkToFilingDetails'] = new_filings['linkToFilingDetails'].str.strip('"')
+
+#     def process_row(row_index):
+#         filing_url = new_filings['linkToFilingDetails'].iloc[row_index]
+
+#         item_data = {}
+#         for item in ["1", "1A", "1B", "2", "3", "4", "5", "6", "7", "7A", "8", "9A", "9B", "10", "11", "12", "13", "14"]:
+#             section_html = extractorApi.get_section(filing_url, item, "html")
+#             item_data[item] = section_html  # key 값을 item 으로 변경
+
+#         return {'item': item_data}  # item_data 를 'item' 키로 감싸서 반환
+
+    # HTML 전처리 함수
+    def preprocess_html(section_html):
+        if section_html is None:
+            return None  # section_html이 None이면 None을 반환하도록 처리
+
+        try:
+            soup = BeautifulSoup(section_html, 'html.parser')
+
+            for hr in soup.find_all('hr'):
+                if hr.get('style') and "page-break-" in hr['style']:
+                    hr.replace_with(BeautifulSoup("<pagebreak>", 'html.parser'))
+
+            auto_break_tags = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']
+
+            for tag in soup.find_all(auto_break_tags):
+                tag.insert_after(BeautifulSoup("<br>", 'html.parser'))
+
+            for tag in soup.find_all(True):
+                if tag.name not in ['table', 'tr', 'td', 'br', 'pagebreak']:
+                    tag.unwrap()
+
+            refined_html_content = str(soup)
+            refined_html_content = re.sub(r'(<br/>)\1+', r'\1', refined_html_content)
+
+            return refined_html_content
+        except Exception as e:
+            print(e)
+            return None  # 오류가 발생하면 None을 반환하도록 처리
+
+    if __name__ == '__main__':
+        API_KEY = secapi_key
+        extractorApi = ExtractorApi(API_KEY)
+
+        item_data = []
+        with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
+            for data in tqdm(pool.imap(process_row, range(len(new_filings)), chunksize=1), total=len(new_filings)):
+                item_data.append(data)
+
+        new_items_df = pd.DataFrame(item_data)
+        new_filings = pd.concat([new_filings, new_items_df], axis=1)
+
+        # HTML 전처리를 위한 코드
+        for index, row in new_filings.iterrows():
+            item_data = row.get('item')  # 'item' 열이 존재하는지 확인
+            if item_data is not None and type(item_data) is not float:
+                for item, section_html in item_data.items():
+                    try:
+                        # 여기에 HTML 전처리 코드 추가
+                        refined_html_content = preprocess_html(section_html)
+                        item_data[item] = refined_html_content
+                    except Exception as e:
+                        print(e)
+                new_filings.at[index, 'item'] = item_data
+                
+        new_filings = new_filings[['id', 'ticker', 'companyName', 'formType', 'description', 'filedAt', 'linkToFilingDetails', 'documentFormatFiles', 'item']]
+        return new_filings
+        
+
+        
+        
+def activate(query):
+    global new_filings
+    conn = sqlite3.connect('/DAProjects/Projects/nGenAI/scr/DEV/update/form10k.db')
+    try:
+        # 10K 공시 전처리         
+        new_filings = make_10k(query)
+        
+        # 중복 데이터 처리
+        print("==> len(new_filings) : ", len(new_filings))
+        new_filings.drop_duplicates(subset=['id'],inplace=True, ignore_index=True)
+        print("==> drop_duplicates len(new_filings) : ", len(new_filings))  
+        
+        # DB 저장 
+        for i in range(len(new_filings)):
+            serialized_link = json.dumps(new_filings.iloc[i]["linkToFilingDetails"])
+            serialized_doc_files = json.dumps(new_filings.iloc[i]["documentFormatFiles"])
+            serialized_items = json.dumps(new_filings.iloc[i]["item"])
+
+            # DB 존재여부 확인
+            chk_id = str(new_filings.iloc[i]["id"])
+            query_string='''
+            SELECT * FROM form10k
+            where id= "%s"
+            '''%(chk_id)
+            data_check = pd.read_sql_query(query_string, conn)
+
+            if data_check.empty:
+                conn.execute("INSERT INTO form10k ('id', 'ticker', 'companyName', 'formType', 'description', 'filedAt', 'linkToFilingDetails', 'documentFormatFiles', 'item') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              , (str(new_filings.iloc[i]["id"]), new_filings.iloc[i]["ticker"], new_filings.iloc[i]["companyName"],new_filings.iloc[i]["formType"],new_filings.iloc[i]["description"],new_filings.iloc[i]["filedAt"],serialized_link,serialized_doc_files,serialized_items))
+                print('insert : ', chk_id)
+            else:
+                print('=========> pass : ', chk_id)
+
+        conn.commit()
+        conn.close()
+        
+    except Exception as e:
+        print(e)
+        
+
+# new_filings 초기화
+conn1 = sqlite3.connect('/DAProjects/Projects/nGenAI/scr/DEV/update/change_stream_edgar.db')
+query_string = '''
+SELECT distinct *
+FROM change_stream_edgar 
+where 1=1
+    and change_stream_edgar.formType in ('10-K')
+order by change_stream_edgar.filedAt
+'''
+new_filings = pd.read_sql_query(query_string, conn1)
+conn1.close()
+
+activate('''
+SELECT * FROM form10k
+''')
+
+#conn = sqlite3.connect('/DAProjects/Projects/nGenAI/scr/DEV/update/form8k.db')
+conn = sqlite3.connect('/DAProjects/Projects/nGenAI/scr/DEV/update/form10k.db')
+
+query_string='''
+SELECT * FROM form10k
+'''
+df = pd.read_sql_query(query_string, conn)
+conn.close()
+
+df.head(2)
