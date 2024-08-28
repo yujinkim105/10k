@@ -1,0 +1,356 @@
+import warnings
+warnings.filterwarnings('ignore')
+import openai
+import configparser
+from cryptography.fernet import Fernet
+import time
+import pandas as pd
+from tqdm import tqdm
+import pandas as pd
+import numpy as np
+import sqlite3
+import json
+import html
+import shutil
+import re
+import ast
+import tiktoken
+import copy
+import os
+from nltk.tokenize import word_tokenize
+import nltk
+from bs4 import BeautifulSoup
+from collections import defaultdict
+from utils_func import *
+
+
+
+# HTML 태그 제거 함수
+def remove_html_tags(text):
+    clean = re.compile('<.*?>')
+    return re.sub(clean, '', text)
+
+# 토큰 수 세는 함수
+def count_tokens(text):
+    tokens = word_tokenize(text)
+    return len(tokens)
+
+# 토큰이 중복되도록 하는 함수
+def overlap_tokens(tokens, chunk_size, overlap_size):
+    overlapped_chunks = []
+    start = 0
+    while start < len(tokens):
+        end = start + chunk_size
+        if end > len(tokens):
+            end = len(tokens)
+        overlapped_chunks.append(tokens[start:end])
+        start += chunk_size - overlap_size
+    return overlapped_chunks
+
+# 결과를 텍스트 파일로 저장하는 함수
+def save_to_txt(directory, filename, content):
+    filepath = os.path.join(directory, filename)
+    with open(filepath, 'w', encoding='utf-8') as file:
+        file.write(content)
+        
+# summarizing 함수 정의
+def summarizing(sentence):
+    conversation=[{"role": "system", "content": '''You are a professional stock analyst. 
+    You will receive a lengthy passage enclosed with <PassageStart> and <PassageEnd> tags. Follow these steps:
+    Step 1: Comprehend the provided passage, which may contain intricate economic and securities terminology. Approach it systematically for better understanding.
+    Step 2: Summarize the passage in English while ensuring compliance with the following four requirements, detailed between <Requirements Start> and <Requirements End>:
+    <Requirements Start>
+    - The final summary must be under 400 tokens and fully encapsulate the content without truncation. Only include essential information to ensure brevity.
+    - Accurately interpret stock-related terms in English.
+    - Restrict the summary to factual details provided; refrain from adding personal interpretations or irrelevant details.
+    - Analyze and present details such as sales figures, units sold, and percentages with precision.
+    <Requirements End>
+    Step 3: Omit the special tokens <PassageStart> and <PassageEnd> from the summarized results.
+    Step 4: Ensure that all sentences are complete and not truncated in the summary.'''}]
+
+    # 프롬프트 확인 후 passage end 있는 문단 가지고 한글로 400토큰으로 번역 요약된 결과 보여줘. 최종 아웃풋은 400토큰으로 한글로 요약된 결과를 알려달라.
+  
+    conversation.append({"role": "user", "content": "<PassageStart>" + sentence + '''<PassageEnd>
+    You have to follow the instruction steps and summarize the given document between <PassageStart> and <PassageEnd> in English with less than 400 tokens.'''})
+    
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo-16k",  
+        messages=conversation,
+        temperature=0.2,
+        max_tokens=1000,
+        top_p=0.1,
+        frequency_penalty=0,
+        presence_penalty=0,
+    )
+    
+    response_message = response.choices[0].message.content.strip()
+    
+    return response_message
+ 
+# 소제목 생성 함수
+def generate_subtitle(content):
+    conversation = [
+        {"role": "system", "content": "Given the passage, generate a subtitle that summarizes the content. Subtitle should be translated to English. Create one subtitle in the form of phrases, not sentences. "},
+        {"role": "user", "content": content}
+    ]
+    
+    response = openai.ChatCompletion.create(
+        model="gpt-4o",
+        messages=conversation,
+        temperature=0.2,
+        max_tokens=100,
+        top_p=0.1,
+        frequency_penalty=0.0,
+        presence_penalty=0.0
+    )
+    
+    subtitle = response.choices[0].message['content']
+    
+    return subtitle
+ 
+    
+def count_files(directory, prefix):
+    pattern = re.compile(rf'^{re.escape(prefix)}(_|\d)')
+    count = 0
+    for filename in os.listdir(directory):
+        if pattern.match(filename):
+            count += 1
+    return count
+
+def chunk_merging_1500(sentence):
+    conversation = [{"role": "system", "content": '''You are a professional stock analyst. 
+    You will receive a lengthy passage enclosed with <PassageStart> and <PassageEnd> tags. Follow these steps:
+    Step 1: Comprehend the provided passage, which may contain intricate economic and securities terminology. Approach it systematically for better understanding.
+    Step 2: Summarize the passage in English while ensuring compliance with the following four requirements, detailed between <Requirements Start> and <Requirements End>:
+    <Requirements Start>
+    - The final summary must be under 1500 tokens and fully encapsulate the content without truncation. Only include essential information to ensure brevity.
+    - Accurately interpret stock-related terms in English.
+    - Restrict the summary to factual details provided; refrain from adding personal interpretations or irrelevant details.
+    - Analyze and present details such as sales figures, units sold, and percentages with precision.
+    - Delete parts that have similar meanings as appropriate. 
+    <Requirements End>
+    Step 3: Omit the special tokens <PassageStart> and <PassageEnd> from the summarized results.
+    Step 4: Translate the summary into English if the output is in English.
+    Step 5: Ensure that all sentences are complete and not truncated in the summary.'''}]
+  
+    conversation.append({"role": "user", "content": "<PassageStart>" + sentence + '''<PassageEnd>
+    You have to follow the instruction steps and summarize the given document between <PassageStart> and <PassageEnd> in English with less than 1500 tokens.'''})
+    
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo-16k",  
+        messages=conversation,
+        temperature=0.2,
+        max_tokens=1500,
+        top_p=0.1,
+        frequency_penalty=0,
+        presence_penalty=0,
+    )
+    
+    response_message = response.choices[0].message.content.strip()
+    
+    return response_message
+
+
+# 청크를 요약하는 함수
+def chunk_merging_3000(chunk):
+    conversation = [
+        {"role": "system", "content": "You are a professional stock analyst."},
+        {"role": "system", "content": "You will receive a lengthy passage enclosed with <PassageStart> and <PassageEnd> tags."},
+        {"role": "system", "content": "Follow these steps to summarize the passage in English:"},
+        {"role": "system", "content": "1. Comprehend the provided passage."},
+        {"role": "system", "content": "2. Summarize the passage while ensuring compliance with certain requirements."},
+        {"role": "system", "content": "<Requirements Start>"},
+        {"role": "system", "content": "- The final summary must be under 1000 tokens."},
+        {"role": "system", "content": "- Accurately interpret stock-related terms in English."},
+        {"role": "system", "content": "- Restrict the summary to factual details provided."},
+        {"role": "system", "content": "- Analyze and present details with precision."},
+        {"role": "system", "content": "- Omit the special tokens <PassageStart> and <PassageEnd> from the summarized results."},
+        {"role": "system", "content": "- Ensure that all sentences are complete and not truncated in the summary."},
+        {"role": "user", "content": "<PassageStart>" + chunk + "<PassageEnd> Ensure that all sentences are complete and not truncated in the summary."}
+    ]
+
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo-16k",
+        messages=conversation,
+        temperature=0.2,
+        max_tokens=1500,
+        top_p=0.1,
+        frequency_penalty=0,
+        presence_penalty=0,
+    )
+
+    response_message = response.choices[0].message.content.strip()
+    return response_message
+
+# 최종 요약본을 생성하는 함수
+def final_summary(text):
+    conversation = [
+        {"role": "system", "content": "You are a professional stock analyst."},
+        {"role": "system", "content": "You will receive a lengthy passage enclosed with <PassageStart> and <PassageEnd> tags."},
+        {"role": "system", "content": "Follow these steps to summarize the passage in English:"},
+        {"role": "system", "content": "1. Comprehend the provided passage."},
+        {"role": "system", "content": "2. Summarize the passage while ensuring compliance with certain requirements."},
+        {"role": "system", "content": "<Requirements Start>"},
+        {"role": "system", "content": "- The final summary must be under 2000 tokens."},
+        {"role": "system", "content": "- Accurately interpret stock-related terms in English."},
+        {"role": "system", "content": "- Restrict the summary to factual details provided."},
+        {"role": "system", "content": "- Analyze and present details with precision."},
+        {"role": "system", "content": "- Omit the special tokens <PassageStart> and <PassageEnd> from the summarized results."},
+        {"role": "system", "content": "- Ensure that all sentences are complete and not truncated in the summary."},
+        {"role": "user", "content": "<PassageStart>" + text + "<PassageEnd> Ensure that all sentences are complete and not truncated in the summary."}
+    ]
+
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo-16k",
+        messages=conversation,
+        temperature=0.2,
+        max_tokens=3000,
+        top_p=0.1,
+        frequency_penalty=0,
+        presence_penalty=0,
+    )
+
+    response_message = response.choices[0].message.content.strip()
+    return response_message
+
+# 디렉토리 내의 파일을 읽어서 요약하는 함수
+def process_3000files(directory, item_prefix):
+    files = [filename for filename in os.listdir(directory) if filename.startswith(f'{item_prefix}_chunk_')]
+    files.sort(key=extract_number)
+
+    all_summaries = []
+
+    for filename in files:
+        with open(os.path.join(directory, filename), 'r') as file:
+            text = file.read()
+            summary = chunk_merging_3000(text) #각 파일을 3000토큰로 요약하는 함수 
+            all_summaries.append(summary)
+
+    merged_summary = ' '.join(all_summaries)
+    merged_summary_tokens = word_tokenize(merged_summary)
+
+    if len(merged_summary_tokens) > 2000:
+        merged_summary = final_summary(merged_summary) # 합친 파일이 2000토큰을 넘으면 다시 2000토큰으로 요약
+
+    return merged_summary
+
+def extract_number(filename):
+    parts = filename.split('_')
+    if len(parts) > 2:
+        return int(parts[2])
+    return 0
+
+def save_summary(summary, save_folder, filename):
+    if not os.path.exists(save_folder):
+        os.makedirs(save_folder)
+    with open(os.path.join(save_folder, filename), 'w') as summary_file:
+        summary_file.write(summary)
+        
+        
+# 문단 구분 함수
+def generate_paragraphs(text):
+    conversation = [
+        {
+            "role": "system",
+            "content": '''You are a professional text formatter. 
+            You will receive a lengthy passage enclosed with <PassageStart> and <PassageEnd> tags. Follow these steps:
+            Step 1: Comprehend the provided passage thoroughly.
+            Step 2: Divide the passage into distinct paragraphs based on content.
+            Step 3: Maintain the original text and order of information. Do not summarize or delete any part of the text.
+            Step 4: Do not add anything to the text, especially "paragraph".
+            '''
+        },
+        {
+            "role": "user",
+            "content": f"<PassageStart>{text}<PassageEnd>"
+        }
+    ]
+
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo-16k",
+        messages=conversation,
+        temperature=0.2,
+        max_tokens=6000,
+        top_p=0.1,
+        frequency_penalty=0,
+        presence_penalty=0,
+    )
+    
+    response_message = response.choices[0].message['content'].strip()
+    
+    return response_message 
+
+
+# 텍스트 파일에서 문서 읽기
+def read_documents_from_files(directory):
+    file_paths = [os.path.join(directory, filename) for filename in os.listdir(directory) if filename.endswith('_fn_3000.txt')]
+    documents = {}
+    for file_path in file_paths:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            text = file.read()
+            documents[file_path] = text
+    return documents
+
+# 파일을 읽고 처리하는 함수
+def process_file(input_path, output_path):
+    with open(input_path, 'r', encoding='utf-8') as file:
+        content = file.read().strip()
+    
+    paragraphs = content.split("\n\n")
+
+    with open(output_path, 'w', encoding='utf-8') as file:
+        for paragraph in paragraphs:
+            subtitle = generate_subtitle(paragraph)
+            file.write(f"{subtitle}\n{paragraph}\n\n")
+
+def copy_single_files(source_directory, destination_directory):
+    # Ensure the destination directory exists
+    if not os.path.exists(destination_directory):
+        os.makedirs(destination_directory)
+    
+    # Iterate through each folder in the source directory
+    for folder_name in os.listdir(source_directory):
+        folder_path = os.path.join(source_directory, folder_name)
+        
+        if os.path.isdir(folder_path):
+            files = os.listdir(folder_path)
+            # Check if the folder contains exactly one file
+            if len(files) == 1:
+                file_path = os.path.join(folder_path, files[0])
+                # Create the new file name by extracting the prefix before '_'
+                new_file_name = f"{folder_name.split('_')[0]}.txt"
+                destination_path = os.path.join(destination_directory, new_file_name)
+                
+                # Copy the file to the destination directory
+                shutil.copy(file_path, destination_path)
+                print(f"Copied {file_path} to {destination_path}")
+                
+                
+def translate(content):
+    conversation = [
+        {"role": "system", "content": "Given the passage, translate it into Korean. Ensure that all sentences are complete and not truncated."},
+        {"role": "user", "content": content}
+    ]
+    
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo-16k",
+        messages=conversation,
+        temperature=0.2,
+        max_tokens=4092,
+        top_p=0.1,
+        frequency_penalty=0.0,
+        presence_penalty=0.0
+    )
+    
+    kr_trans = response.choices[0].message['content']
+    
+    return kr_trans
+
+# 파일 합치기 및 태그 추가 함수
+def merge_files_with_tags(input_files, output_file, tags):
+    with open(output_file, 'w', encoding='utf-8') as outfile:
+        for file_path, tag in zip(input_files, tags):
+            with open(file_path, 'r', encoding='utf-8') as infile:
+                outfile.write(f"{tag}\n")
+                outfile.write(infile.read())
+                outfile.write("\n\n")  # 파일 간 구분을 위해 줄바꿈 추가
