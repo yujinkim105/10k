@@ -1,0 +1,388 @@
+import warnings
+warnings.filterwarnings('ignore')
+import openai
+import configparser
+from cryptography.fernet import Fernet
+import time
+import pandas as pd
+from tqdm import tqdm
+import pandas as pd
+import numpy as np
+import sqlite3
+import json
+import html
+import shutil
+import re
+import ast
+import tiktoken
+import copy
+import os
+from nltk.tokenize import word_tokenize
+import nltk
+from bs4 import BeautifulSoup
+from collections import defaultdict
+from utils_func import *
+
+# 설정 파일 읽기
+config = configparser.ConfigParser()
+config.read('/DAProjects/Projects/nGenAI/scr/config.ini')
+# 암호화된 API 키 가져오기
+encrypted_openai_key = config['API_KEYS']['openaikey_qa'].encode('utf-8')
+#key
+cipher_suite = Fernet('NA6zCSbP6pIrqBtJXAv6XkRLWvCzUacOPbEe___mhpo=')
+# API 키 복호화
+openai_key = cipher_suite.decrypt(encrypted_openai_key).decode('utf-8')
+# API 키 설정
+openai.api_key = openai_key
+
+# 티커 입력 및 chunk 저장 ==============================================================
+
+os.mkdir('/DAProjects/Projects/nGenAI/scr/DEV/update/ticker')
+os.mkdir('/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/origin_chunk')
+
+conn = sqlite3.connect('/DAProjects/Projects/nGenAI/scr/DEV/update/form10k.db')
+query_string='''
+SELECT * FROM form10k
+'''
+df_10k = pd.read_sql_query(query_string, conn)
+conn.close()
+
+# 티커 결측값 삭제
+df_10k_filtered = df_10k[df_10k['ticker'] != '']
+
+# 사용자로부터 티커 입력받기 
+ticker = input("Enter the ticker: ").strip().upper()
+
+# 입력받은 티커에 해당하는 데이터 필터링
+df_10k_ticker = df_10k_filtered[df_10k_filtered['ticker'] == ticker]
+ticker_html = df_10k_ticker['item'].iloc[0]
+ticker_dict = ast.literal_eval(ticker_html)
+ticker_dict2 = ticker_dict.copy()
+
+keys_to_remove = ["1B", "1C", "2",  "4",  "6",  "7A",  "9", "9A", "9B", "10", "11", "12", "13", "14","15"]
+
+for key in keys_to_remove:
+    ticker_dict2.pop(key, None)
+    
+    
+# 결과를 저장할 딕셔너리
+results = defaultdict(list)
+
+for key, value in ticker_dict2.items():
+    # HTML 태그 제거
+    text = remove_html_tags(value)
+    # 토큰 수 계산
+    token_count = count_tokens(text)
+    
+    if token_count <= 7000:
+        # 7000 이하인 경우 하나의 chunk로 묶음
+        results[key].append((text, token_count))
+    else:
+        # 7000 초과인 경우 토큰 약 5000개 기준으로 나누고 중복되게 처리
+        chunks = overlap_tokens(text, 5000, 1000)
+        for i, chunk in enumerate(chunks):
+            results[f"{key}_{int(i):02d}"].append((chunk, len(chunk)))
+
+# 결과 출력
+for key, chunks in results.items():
+    print(f"{key}:")
+    for i, (chunk, token_count) in enumerate(chunks, start=1):
+        print(f"Chunk {i}: {token_count} tokens")
+        print(chunk)
+        
+
+# 결과 출력 및 저장
+for key, chunks in results.items():
+    print(f"{key}:")
+    for i, (chunk, token_count) in enumerate(chunks, start=1):
+        print(f"Chunk {i}: {token_count} tokens")
+        print(chunk)
+        print()
+        # 파일 이름 설정
+        # filename = f"{key}_{i}.txt" if len(chunks) > 1 else f"{key}.txt"
+        filename = f"{key}_{int(i):02d}.txt" if len(chunks) > 1 else f"{key}_origin.txt"
+        # 파일에 저장
+        save_to_txt('/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/origin_chunk', filename, chunk)
+        
+
+# 1차요약(400 토큰) ==================================================================
+directory1 = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/origin_chunk'
+os.mkdir('/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/400')
+os.mkdir('/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/400/1_400')
+os.mkdir('/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/400/1A_400')
+os.mkdir('/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/400/3_400')
+os.mkdir('/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/400/5_400')
+os.mkdir('/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/400/7_400')
+os.mkdir('/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/400/8_400')
+
+# 디렉토리 경로
+save_folder_1 = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/400/1_400'
+save_folder_1A = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/400/1A_400'
+save_folder_3 = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/400/3_400'
+save_folder_5 = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/400/5_400'
+save_folder_7 = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/400/7_400'
+save_folder_8 = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/400/8_400'
+
+
+prefix_list = ['1', '1A', '3', '5', '7', '8']
+
+for prefix in prefix_list:
+    file_count = count_files(directory1, prefix)
+    
+    if file_count == 1:
+        # 파일 처리 코드
+        file_name = f'{prefix}_origin.txt'
+        file_path = os.path.join(directory1, file_name)
+        if os.path.exists(file_path):
+            with open(file_path, 'r') as file:
+                text = file.read()
+                summary = summarizing(text)
+                subtitle = generate_subtitle(summary)
+                # 요약 파일 저장
+                summary_file_name = f'{prefix}_summary.txt'
+                summary_file_path = os.path.join(eval(f'save_folder_{prefix}'), summary_file_name)
+                with open(summary_file_path, 'w') as summary_file:
+                    summary_file.write(subtitle+'\n')
+                    summary_file.write(summary)
+
+
+    elif file_count > 1:
+        # 파일 처리 코드
+        file_list = os.listdir(directory1)
+        for i in range(file_count):
+            file_name = f'{prefix}_{str(i).zfill(2)}_origin.txt'
+            file_path = os.path.join(directory1, file_name)
+            if os.path.exists(file_path):
+                with open(file_path, 'r') as file:
+                    text = file.read()
+                    summary = summarizing(text)
+                    
+                    # 요약 파일 저장
+                    summary_file_name = f'{prefix}_{str(i).zfill(2)}_summary.txt'
+                    summary_file_path = os.path.join(eval(f'save_folder_{prefix}'), summary_file_name)
+                    with open(summary_file_path, 'w') as summary_file:
+                        summary_file.write(summary)
+                        
+print('Chunk summaries 400 saved successfully.')
+                        
+# 2차요약(1500)===================================================================
+
+# 항목 목록
+directory2 = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/400'
+
+# 1500 디렉토리 생성
+save_base_folder = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/1500'
+os.makedirs(save_base_folder, exist_ok=True)
+
+for prefix in prefix_list:
+    folder_path = os.path.join(directory2, f'{prefix}_400')
+    file_count = count_files(folder_path, f'{prefix}_')
+    
+    if file_count > 1:
+        chunk_sets = []
+        chunk_size = 10
+        for i in range(0, file_count, chunk_size):
+            chunk_sets.append((i, min(i + chunk_size - 1, file_count - 1)))
+        
+        save_folder = os.path.join(save_base_folder, f'{prefix}_1500')
+        os.makedirs(save_folder, exist_ok=True)
+        
+        for chunk_set in chunk_sets:
+            combined_text = ""
+            for i in range(chunk_set[0], chunk_set[1] + 1):
+                file_name = f'{prefix}_{str(i).zfill(2)}_summary.txt'
+                file_path = os.path.join(folder_path, file_name)
+                if os.path.exists(file_path):
+                    with open(file_path, 'r') as file:
+                        text = file.read()
+                        combined_text += text + " "
+            
+            summary = chunk_merging_1500(combined_text)
+            chunk_start = chunk_set[0]
+            chunk_end = chunk_set[1]
+            summary_file_name = f'{prefix}_chunk_{chunk_start}_{chunk_end}.txt'
+            summary_file_path = os.path.join(save_folder, summary_file_name)
+            with open(summary_file_path, 'w') as summary_file:
+                summary_file.write(summary)
+
+print('Chunk summaries 1500 saved successfully.')
+                
+# 3차요약(3000) ==================================================================================
+
+def main():
+    base_directory = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/1500'
+    save_base_folder = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/3000'
+
+    for item_folder in os.listdir(base_directory):
+        item_path = os.path.join(base_directory, item_folder)
+        if os.path.isdir(item_path) and '_1500' in item_folder:
+            item_prefix = item_folder.split('_')[0]
+            merged_summary = process_files(item_path, item_prefix)
+            save_summary(merged_summary, save_base_folder, f'{item_prefix}_fn_3000.txt')
+
+if __name__ == "__main__":
+    main()
+    
+print('Chunk summaries 3000 saved successfully.')
+
+# 문단 나누고 소제목 달기 ===========================================================
+
+# 메인 함수
+def main():
+    input_directory1 = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/3000/'
+    intermediate_directory1 = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/3000_linebreaking'
+    output_directory1 = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/merge'
+
+    if not os.path.exists(intermediate_directory1):
+        os.makedirs(intermediate_directory1)
+    
+    if not os.path.exists(output_directory1):
+        os.makedirs(output_directory1)
+
+    # 문서 읽기
+    documents = read_documents_from_files(input_directory1)
+    
+    # 문단 나누기
+    for file_path, text in documents.items():
+        item = os.path.basename(file_path).split('_')[0]
+        divided_text = generate_paragraphs(text)
+        intermediate_file_path = os.path.join(intermediate_directory1, f'{item}_div.txt')
+        with open(intermediate_file_path, 'w', encoding='utf-8') as divided_file:
+            divided_file.write(divided_text)
+    
+    # 소제목 생성
+    for file_path in os.listdir(intermediate_directory1):
+        item = file_path.split('_')[0]
+        input_file_path = os.path.join(intermediate_directory1, file_path)
+        output_file_path = os.path.join(output_directory1, f'{item}.txt')
+        process_file(input_file_path, output_file_path)
+
+if __name__ == "__main__":
+    main()
+
+print('Chunk summaries division  saved successfully.')
+
+# merge로 한개짜리 파일 가져오기=========================================
+
+def copy_single_files(source_directory, destination_directory):
+    # Ensure the destination directory exists
+    if not os.path.exists(destination_directory):
+        os.makedirs(destination_directory)
+    
+    # Iterate through each folder in the source directory
+    for folder_name in os.listdir(source_directory):
+        folder_path = os.path.join(source_directory, folder_name)
+        
+        if os.path.isdir(folder_path):
+            files = os.listdir(folder_path)
+            # Check if the folder contains exactly one file
+            if len(files) == 1:
+                file_path = os.path.join(folder_path, files[0])
+                # Create the new file name by extracting the prefix before '_'
+                prefix = folder_name.split('_')[0]
+                new_file_name = f"{prefix}.txt"
+                destination_path = os.path.join(destination_directory, new_file_name)
+                
+                # Copy the file to the destination directory
+                shutil.copy(file_path, destination_path)
+                print(f"Copied {file_path} to {destination_path}")
+
+# Define source and destination directories
+source_directory = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/400'
+destination_directory = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/merge'
+
+# Execute the function
+copy_single_files(source_directory, destination_directory)
+
+
+# 번역하기====================================================================\
+
+# 입력 파일과 출력 파일 설정
+input_directory2 = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/merge'
+output_directory2 = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/merge'
+
+input_files = ['1.txt', '1A.txt', '3.txt', '5.txt', '7.txt', '8.txt']
+output_files = [f'{file.split(".")[0]}_kr.txt' for file in input_files]
+
+# 파일 번역 및 저장
+for input_file, output_file in zip(input_files, output_files):
+    input_path = os.path.join(input_directory2, input_file)
+    output_path = os.path.join(output_directory2, output_file)
+    
+    with open(input_path, 'r', encoding='utf-8') as infile:
+        content = infile.read()
+        
+    translated_content = translate(content)
+    
+    with open(output_path, 'w', encoding='utf-8') as outfile:
+        outfile.write(translated_content)
+
+# 합치기 ===========================================================
+
+# 디렉토리 설정
+directory3 = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker/merge'
+
+# 입력 파일 경로 리스트
+input_files = [
+    os.path.join(directory3, '1_kr.txt'),
+    os.path.join(directory3, '1A_kr.txt'),
+    os.path.join(directory3, '3_kr.txt'),
+    os.path.join(directory3, '5_kr.txt'),
+    os.path.join(directory3, '7_kr.txt'),
+    os.path.join(directory3, '8_kr.txt')
+]
+
+# 각 파일 앞에 삽입할 태그 리스트
+tags = [
+    "Item 1",
+    "Item 1A",
+    "Item 3",
+    "Item 5",
+    "Item 7",
+    "Item 8"
+]
+
+# 출력 파일 경로
+output_file = os.path.join('/DAProjects/Projects/nGenAI/scr/DEV/update/ticker', 'fn_report.txt')
+
+# 파일 합치기 호출
+merge_files_with_tags(input_files, output_file, tags)
+
+# 새 파일명 생성
+new_filename = f"{ticker}_fn_report.txt"
+
+# 새 파일 경로
+new_file_path = os.path.join('/DAProjects/Projects/nGenAI/scr/DEV/update/ticker', new_filename)
+
+# 파일명 변경
+os.rename(output_file, new_file_path)
+
+# 파일 이동할 경로
+destination_folder = '/DAProjects/Projects/nGenAI/scr/DEV/update/fn_report'
+destination_path = os.path.join(destination_folder, new_filename)
+
+# 파일 이동
+shutil.move(new_file_path, destination_path)
+
+# 기존 폴더 내 파일 삭제
+ticker_folder = '/DAProjects/Projects/nGenAI/scr/DEV/update/ticker'
+
+# 기존 폴더 및 그 안의 모든 파일 삭제
+try:
+    shutil.rmtree(ticker_folder)
+    print(f"Successfully deleted folder: {ticker_folder}")
+except Exception as e:
+    print(f"Failed to delete folder {ticker_folder}. Reason: {e}")
+    
+        
+print(f"Files have been successfully merged into {output_file}")
+
+#=====================================================================
+
+# # 출력 파일 경로
+# output_file = os.path.join('/DAProjects/Projects/nGenAI/scr/DEV/update/ticker', 'fn_report.txt')
+
+# # 파일 합치기 호출
+# merge_files_with_tags(input_files, output_file, tags)
+
+# print(f"Files have been successfully merged into {output_file}")
