@@ -1,0 +1,162 @@
+import json, re
+import pandas as pd
+from sec_api import ExtractorApi
+from bs4 import BeautifulSoup
+import requests
+import time
+import numpy as np
+from tqdm import tqdm
+from datetime import datetime, timedelta
+import sqlite3
+import ast
+
+from sec_api import FullTextSearchApi
+from sec_api import QueryApi
+import configparser
+from cryptography.fernet import Fernet
+import os
+import openai
+import tiktoken
+from dateutil.relativedelta import relativedelta
+
+#####################################################################################
+# Stream으로 들어오는 8K에 대한 전처리 / S&P500 기업에 대해서는 요약 및 질의 리스트 생성까지 
+#####################################################################################
+
+# s&p500만 수행 여부
+sp500_only=False
+
+# 설정 파일 읽기
+config = configparser.ConfigParser()
+config.read('/DAProjects/Projects/nGenAI/scr/config.ini')
+
+# 암호화된 API 키 가져오기
+encrypted_secapi_key = config['API_KEYS']['secapikey'].encode('utf-8')
+encrypted_openai_key = config['API_KEYS']['openaikey_qa'].encode('utf-8')
+
+#key
+cipher_suite = Fernet('NA6zCSbP6pIrqBtJXAv6XkRLWvCzUacOPbEe___mhpo=')
+
+# API 키 복호화
+secapi_key = cipher_suite.decrypt(encrypted_secapi_key).decode('utf-8')
+openai_key = cipher_suite.decrypt(encrypted_openai_key).decode('utf-8')
+
+# API key
+API_KEY = secapi_key
+extractorApi = ExtractorApi(API_KEY)
+fullTextSearchApi = FullTextSearchApi(api_key=API_KEY)
+queryApi = QueryApi(api_key=API_KEY)
+openai.api_key = openai_key
+openai.api_key = '' #비공개
+
+
+import sqlite3
+import pandas as pd
+conn = sqlite3.connect('/DAProjects/Projects/nGenAI/scr/DEV/update/form10k.db')
+
+query_string='''
+SELECT * FROM form10k
+'''
+df_10k = pd.read_sql_query(query_string, conn)
+conn.close()
+
+df_10k
+
+
+# 'ticker' 열에서 빈 문자열('')을 찾고, 그 개수를 계산
+empty_ticker_count = (df_10k['ticker'] == '').sum()
+print(f"'ticker' 열에 빈 문자열로 되어 있는 행의 개수: {empty_ticker_count}")
+# Filtering rows where 'ticker' column is an empty string
+empty_ticker_df = df_10k[df_10k['ticker'] == '']
+
+# Displaying the resulting DataFrame
+empty_ticker_df
+
+
+# 'ticker' 열에서 빈 문자열이 아닌 행만 필터링하여 새로운 데이터프레임 생성
+df_10k_filtered = df_10k[df_10k['ticker'] != '']
+
+# 결과 확인
+df_10k_filtered.head(2)
+
+import pandas as pd
+import ast  # 문자열을 딕셔너리로 안전하게 변환하기 위해 필요
+import re  # HTML 태그를 제거하기 위해 필요
+
+# HTML 태그를 제거하는 함수
+def remove_html_tags(raw_html):
+    cleanr = re.compile("<.*?>|&([a-z0-9]+|#[0-9]{1,6}|#x[0-9a-f]{1,6});")
+    cleantext = re.sub(cleanr, "", raw_html)
+    cleantext = re.sub(r'\s{2,}', " ", cleantext)
+    cleantext = re.sub("(\n|\t)", " ", cleantext)
+    cleantext = re.sub("(\xa0|\x0b)", " ", cleantext)
+    cleantext = re.sub(' +', ' ', cleantext)
+    return cleantext
+
+# 문자열 형태의 딕셔너리를 실제 딕셔너리로 변환하는 함수
+def string_to_dict(item_str):
+    try:
+        item_dict = ast.literal_eval(item_str)
+        # 딕셔너리의 각 값에 대해 HTML 태그를 제거
+        item_dict = {key: remove_html_tags(value) for key, value in item_dict.items()}
+        return item_dict
+    except ValueError:
+        # 변환에 실패하는 경우, 빈 딕셔너리를 반환
+        return {}
+
+def calculate_token_counts(item_dict):
+    token_counts = {}
+    for key, value in item_dict.items():
+        # 여기서 value는 HTML 태그가 제거된 문자열이며, 토큰의 수를 계산합니다.
+        token_counts[key] = len(value.split())
+    return token_counts
+
+
+
+df_10k_filtered['item'] = df_10k_filtered['item'].apply(string_to_dict)
+
+# 'num_item' 열을 생성하고, 각 item에 대한 토큰 수를 계산
+df_10k_filtered['num_item'] = df_10k_filtered['item'].apply(calculate_token_counts)
+
+# 결과 확인
+print(df_10k_filtered[['id', 'num_item']].head())
+
+
+import pandas as pd
+import numpy as np
+
+# 각 item별로 모든 회사의 토큰 수를 모으는 과정
+item_dict = {}
+for index, row in df_10k_filtered.iterrows():
+    num_item = row['num_item']
+    for item, count in num_item.items():
+        if item not in item_dict:
+            item_dict[item] = []
+        item_dict[item].append(count)
+
+# 각 item별 통계량 계산
+std_dict = {item: np.std(counts, ddof=1) for item, counts in item_dict.items()}
+average_dict = {item: np.mean(counts) for item, counts in item_dict.items()}
+max_dict = {item: np.max(counts) for item, counts in item_dict.items()}
+min_dict = {item: np.min(counts) for item, counts in item_dict.items()}
+median_dict = {item: np.median(counts) for item, counts in item_dict.items()}
+
+# 각 통계량을 df_10k_filtered에 추가
+df_10k_filtered['std'] = df_10k_filtered['num_item'].apply(lambda x: {item: std_dict[item] for item in x})
+df_10k_filtered['average'] = df_10k_filtered['num_item'].apply(lambda x: {item: average_dict[item] for item in x})
+df_10k_filtered['max'] = df_10k_filtered['num_item'].apply(lambda x: {item: max_dict[item] for item in x})
+df_10k_filtered['min'] = df_10k_filtered['num_item'].apply(lambda x: {item: min_dict[item] for item in x})
+df_10k_filtered['median'] = df_10k_filtered['num_item'].apply(lambda x: {item: median_dict[item] for item in x})
+
+df_10k_filtered.head(2)
+df_10k_filtered.columns
+df_10k_stat = df_10k_filtered[['num_item', 'std', 'average', 'max', 'min', 'median']].copy()
+df_10k_stat 
+
+average_data = df_10k_stat['average'].iloc[0]
+median_data = df_10k_stat['median'].iloc[0]
+max_data = df_10k_stat['max'].iloc[0]
+min_data = df_10k_stat['min'].iloc[0]
+std_data = df_10k_stat['std'].iloc[0]
+# 데이터프레임 생성
+df10k_fn_stat = pd.DataFrame({'average': average_data, 'median':median_data, 'max':max_data, 'min':min_data ,'std': std_data})
